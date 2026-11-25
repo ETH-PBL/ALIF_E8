@@ -1,5 +1,23 @@
 # e8-vit-quickstart
 
+## Citation
+
+If you use this work, please cite:
+
+```bibtex
+@misc{bonazzi2026tinymlhitsmemorywall,
+      title={TinyML Hits the Memory Wall: A Benchmark of Ten Sub-Watt Edge Devices},
+      author={Pietro Bonazzi and Luigi Capogrosso and Ahmet Celik and Rosanna Manzo and Marco Giordano and Szymon Ruciński and Jonathan Hungerbuehler and Michele Magno},
+      year={2026},
+      eprint={2611.03392},
+      archivePrefix={arXiv},
+      primaryClass={cs.AR},
+      url={https://arxiv.org/abs/2611.03392},
+}
+```
+
+## Overview
+
 A from-scratch guide to running a Vision Transformer on the Alif Ensemble E8 (Ethos-U85 NPU):
 train or finetune a simple ViT, quantize and compile it, build the firmware, flash it, and run
 it on the board while reading the on-device latency.
