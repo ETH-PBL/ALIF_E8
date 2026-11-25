@@ -1,0 +1,300 @@
+diff --git a/source/application/api/fwk/tflm/include/MobileNetModel.hpp b/source/application/api/fwk/tflm/include/MobileNetModel.hpp
+index afc2b43..e5be174 100644
+--- a/source/application/api/fwk/tflm/include/MobileNetModel.hpp
++++ b/source/application/api/fwk/tflm/include/MobileNetModel.hpp
+@@ -38,7 +38,7 @@ protected:
+ 
+ private:
+     /* Maximum number of individual operations that can be enlisted. */
+-    static constexpr int ms_maxOpCnt = 7;
++    static constexpr int ms_maxOpCnt = 8;
+ 
+     /* A mutable op resolver instance. */
+     tflite::MicroMutableOpResolver<ms_maxOpCnt> m_opResolver;
+diff --git a/source/application/api/fwk/tflm/source/MobileNetModel.cc b/source/application/api/fwk/tflm/source/MobileNetModel.cc
+index 7bd4c6d..94009ce 100644
+--- a/source/application/api/fwk/tflm/source/MobileNetModel.cc
++++ b/source/application/api/fwk/tflm/source/MobileNetModel.cc
+@@ -39,5 +39,8 @@ bool arm::app::fwk::tflm::MobileNetModel::EnlistOperations()
+         printf_err("Failed to add Arm NPU support to op resolver.");
+         return false;
+     }
++
++    /* The one operator Vela leaves on the CPU for a ViT: the class token selection before the head. */
++    this->m_opResolver.AddGather();
+     return true;
+ }
+diff --git a/source/hal/source/platform/alif/source/retarget_alif.c b/source/hal/source/platform/alif/source/retarget_alif.c
+index 8d5be86..48ca477 100644
+--- a/source/hal/source/platform/alif/source/retarget_alif.c
++++ b/source/hal/source/platform/alif/source/retarget_alif.c
+@@ -324,7 +324,7 @@ int fgetc(FILE *f)
+ {
+     UNUSED(f);
+ 
+-    return UartPutc(UartGetc());
++    return UartGetc();
+ }
+ 
+ #ifndef ferror
+diff --git a/source/use_case/img_class/src/UseCaseHandler.cc b/source/use_case/img_class/src/UseCaseHandler.cc
+index 3f2681e..a6c9088 100644
+--- a/source/use_case/img_class/src/UseCaseHandler.cc
++++ b/source/use_case/img_class/src/UseCaseHandler.cc
+@@ -17,46 +17,33 @@
+  */
+ #include "UseCaseHandler.hpp"
+ 
+-#include "Classifier.hpp"
+-#include "ImageUtils.hpp"
+-#include "ImgClassProcessing.hpp"
+ #include "MobileNetModel.hpp"
+ #include "UseCaseCommonUtils.hpp"
+ #include "hal.h"
+ #include "log_macros.h"
+ 
++#include <algorithm>
+ #include <cinttypes>
+-
+-using ImgClassClassifier = arm::app::Classifier;
++#include <cstdio>
++#include <vector>
+ 
+ namespace arm {
+ namespace app {
+ 
+-    /** Based on ML framework, set up the model namespace. */
+-#if defined(MLEK_FWK_TFLM)
+-    using fwk::tflm::MobileNetModel;
+-#elif defined(MLEK_FWK_EXECUTORCH)
+-    using fwk::et::MobileNetModel;
+-    namespace img_class {
+-        extern const unsigned int g_numChannels;
+-        extern const float g_normMean[];
+-        extern const float g_normStddev[];
+-    } /* namespace img_class */
+-#endif /** MLEK_FWK_TFLM or MLEK_FWK_EXECUTORCH */
+-
+-    /* Image classification inference handler. */
++    static void UartReadBytes(int8_t* buf, size_t len)
++    {
++        for (size_t i = 0; i < len; ++i) {
++            int c = getchar();
++            buf[i] = static_cast<int8_t>(c);
++        }
++    }
++
++    /* UART mode: read one quantized frame from the console, run it, print latency and top-5. */
+     bool ClassifyImageHandler(ApplicationContext& ctx)
+     {
+         auto& profiler = ctx.Get<Profiler&>("profiler");
+-        auto& model    = ctx.Get<fwk::iface::Model&>("model");
+-
+-        constexpr uint32_t dataPsnImgDownscaleFactor = 2;
+-        constexpr uint32_t dataPsnImgStartX          = 10;
+-        constexpr uint32_t dataPsnImgStartY          = 35;
+-
+-        constexpr uint32_t dataPsnTxtInfStartX = 150;
+-        constexpr uint32_t dataPsnTxtInfStartY = 40;
+ 
++        auto& model = ctx.Get<fwk::iface::Model&>("model");
+         if (!model.IsInited()) {
+             printf_err("Model is not initialised! Terminating processing.\n");
+             return false;
+@@ -64,139 +51,83 @@ namespace app {
+ 
+         auto inputTensor  = model.GetInputTensor(0);
+         auto outputTensor = model.GetOutputTensor(0);
+-        auto inputShape   = inputTensor->Shape();
+-        if (inputShape.size() < 4) {
+-            printf_err("Input tensor dimension should be = 4\n");
+-            return false;
+-        }
+ 
+-        /* Get input shape for displaying the image. */
+-        const uint32_t nCols     = inputShape[MobileNetModel::ms_inputColsIdx];
+-        const uint32_t nRows     = inputShape[MobileNetModel::ms_inputRowsIdx];
+-        const uint32_t nChannels = inputShape[MobileNetModel::ms_inputChannelsIdx];
+-
+-        if (nChannels != ImgClassPreProcess::kNumChannels) {
+-            printf_err("Number of channels mismatch\n");
++        const auto inputShape = inputTensor->Shape();
++        if (inputShape.empty() || inputShape.size() < 4) {
++            printf_err("Invalid input tensor dims\n");
+             return false;
+         }
+ 
+-#if defined(MLEK_FWK_EXECUTORCH)
+-        /**
+-         * For ExecuTorch we typically have input tensors in floating point.
+-         * In this case, normalisation parameters should be made available
+-         * with the model. We try to use these here.
+-         */
+-        /* Set up pre- and post-processing. */
+-        std::array<float, ImgClassPreProcess::kNumChannels> normMean{0.f, 0.f, 0.f};
+-        std::array<float, ImgClassPreProcess::kNumChannels> normStddev{1.f, 1.f, 1.f};
+-
+-        if (inputTensor->Type() == fwk::iface::TensorType::FP32 ||
+-            inputTensor->Type() == fwk::iface::TensorType::FP16) {
+-
+-            /* Check for mismatch in size of channels. */
+-            if (ImgClassPreProcess::kNumChannels != img_class::g_numChannels) {
+-                printf_err("Number of channels mismatch in norm parameters\n");
+-                return false;
+-            }
+-
+-            /* Assign values. */
+-            for (size_t i = 0; i < ImgClassPreProcess::kNumChannels; ++i) {
+-                normMean[i] = img_class::g_normMean[i];
+-                normStddev[i] = img_class::g_normStddev[i];
++        const int inputImgRows = inputShape[fwk::tflm::MobileNetModel::ms_inputRowsIdx];
++        const int inputImgCols = inputShape[fwk::tflm::MobileNetModel::ms_inputColsIdx];
++        const size_t inputBytes = inputTensor->Bytes();
+ 
+-                if (0.f == normStddev[i]) {
+-                    printf_err("Invalid std value: %f\n", normStddev[i]);
+-                    return false;
+-                }
+-            }
+-        }
+-        auto preProcess = ImgClassPreProcess(inputTensor, normMean, normStddev);
+-#else /* defined(MLEK_FWK_EXECUTORCH) */
+-        auto preProcess = ImgClassPreProcess(inputTensor);
+-#endif /* defined(MLEK_FWK_EXECUTORCH) */
+-
+-        std::vector<ClassificationResult> results;
+-        ImgClassPostProcess postProcess =
+-            ImgClassPostProcess(outputTensor,
+-                                ctx.Get<ImgClassClassifier&>("classifier"),
+-                                ctx.Get<std::vector<std::string>&>("labels"),
+-                                results);
+-        hal_camera_init();
+-        auto bCamera = hal_camera_configure(nCols,
+-            nRows,
+-            HAL_CAMERA_MODE_SINGLE_FRAME,
+-            HAL_CAMERA_COLOUR_FORMAT_RGB888);
+-        if (!bCamera) {
+-            printf_err("Failed to configure camera.\n");
+-            return false;
++        const auto outputShape = outputTensor->Shape();
++        int numClasses = 1;
++        for (size_t i = 0; i < outputShape.size(); ++i) {
++            numClasses *= outputShape[i];
+         }
+ 
+-        while(true) {
+-#ifdef INTERACTIVE_MODE
+-            AwaitUserInput(); // Wait for user input before moving forward.
+-#endif /* INTERACTIVE_MODE */
++        info("UART mode: input %dx%dx3 = %zu bytes, output %d classes\n",
++             inputImgRows, inputImgCols, inputBytes, numClasses);
+ 
+-            hal_display_clear(COLOR_BLACK);
+-            hal_camera_start();
++        while (true) {
++            printf("READY\r\n");
++            fflush(stdout);
+ 
+-            /* Strings for presentation/logging. */
+-            std::string str_inf{"Running inference... "};
++            int8_t* inputData = inputTensor->GetData<int8_t>();
++            UartReadBytes(inputData, inputBytes);
+ 
+-            uint32_t capturedFrameSize = 0;
+-            const uint8_t* imgSrc = hal_camera_get_captured_frame(&capturedFrameSize);
+-            if (!imgSrc || !capturedFrameSize) {
+-                break;
+-            }
+-
+-            /* Display this image on the LCD. */
+-            hal_display_show_image(imgSrc,
+-                                   nCols,
+-                                   nRows,
+-                                   nChannels,
+-                                   dataPsnImgStartX,
+-                                   dataPsnImgStartY,
+-                                   dataPsnImgDownscaleFactor);
+-
+-            /* Display message on the LCD - inference running. */
+-            hal_display_show_text(
+-                str_inf.c_str(), str_inf.size(), dataPsnTxtInfStartX, dataPsnTxtInfStartY, false);
+-
+-            const size_t imgSz =
+-                inputTensor->Bytes() < capturedFrameSize ? inputTensor->Bytes() : capturedFrameSize;
+-
+-            /* Run the pre-processing, inference and post-processing. */
+-            if (!preProcess.DoPreProcess(imgSrc, imgSz)) {
+-                printf_err("Pre-processing failed.");
+-                return false;
+-            }
++            /* Latency from the Cortex-M55 cycle counter around the inference. */
++            CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
++            DWT->CYCCNT = 0;
++            DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
++            uint32_t t_start = DWT->CYCCNT;
+ 
+             if (!RunInference(model, profiler)) {
+                 printf_err("Inference failed.");
+                 return false;
+             }
+ 
+-            if (!postProcess.DoPostProcess()) {
+-                printf_err("Post-processing failed.\n");
+-                return false;
++            uint32_t t_end = DWT->CYCCNT;
++            uint32_t cycles = t_end - t_start;
++            float inferenceMs = static_cast<float>(cycles) / (SystemCoreClock / 1000.0f);
++
++            const int8_t* rawOutput = outputTensor->GetData<int8_t>();
++            const auto quant = outputTensor->GetQuantParams();
++            const float scale = quant.scale;
++            const int zeroPoint = quant.offset;
++
++            struct ClassScore {
++                int classIdx;
++                float score;
++            };
++            std::vector<ClassScore> top5(5, {-1, -1e9f});
++
++            for (int i = 0; i < numClasses; ++i) {
++                float score = (static_cast<float>(rawOutput[i]) - zeroPoint) * scale;
++                int minIdx = 0;
++                for (int j = 1; j < 5; ++j) {
++                    if (top5[j].score < top5[minIdx].score) {
++                        minIdx = j;
++                    }
++                }
++                if (score > top5[minIdx].score) {
++                    top5[minIdx] = {i, score};
++                }
+             }
+ 
+-            /* Erase. */
+-            str_inf = std::string(str_inf.size(), ' ');
+-            hal_display_show_text(
+-                str_inf.c_str(), str_inf.size(), dataPsnTxtInfStartX, dataPsnTxtInfStartY, false);
+-
+-            /* Add results to context for access outside handler. */
+-            ctx.Set<std::vector<ClassificationResult>>("results", results);
++            std::sort(top5.begin(), top5.end(),
++                      [](const ClassScore& a, const ClassScore& b) {
++                          return a.score > b.score;
++                      });
+ 
+-#if VERIFY_TEST_OUTPUT
+-            arm::app::DumpTensor(outputTensor);
+-#endif /* VERIFY_TEST_OUTPUT */
+-
+-            if (!PresentInferenceResult(results)) {
+-                return false;
++            printf("RESULT:5,%.2f\r\n", inferenceMs);
++            for (int i = 0; i < 5; ++i) {
++                printf("CLASS:%d,%.4f\r\n", top5[i].classIdx, top5[i].score);
+             }
+-
+-            profiler.PrintProfilingResult();
++            printf("END\r\n");
++            fflush(stdout);
+         }
+ 
+         return true;

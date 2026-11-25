@@ -1,0 +1,16 @@
+services:
+  alif-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: alif-dev
+    container_name: alif-dev
+    stdin_open: true
+    tty: true
+    volumes:
+      - ../:/workspace
+    # Uncomment for flashing on Linux. ttyACM0 is the J-Link SEUART.
+    # The MCU USB port (usb-to-ospi-flasher) enumerates as a second ttyACM.
+    # devices:
+    #   - /dev/ttyACM0:/dev/ttyACM0
+    #   - /dev/ttyACM1:/dev/ttyACM1
